@@ -29,6 +29,8 @@ The agent **cannot**:
 - **(Force) push to your repos.** The VM has no credentials for your remotes, and the host's copy is
   read-only to it. Work only leaves the VM when you `git fetch vm` on the host. Review it before you
   merge it.
+- **Open ports on your machine.** Lima's automatic port forwarding is switched off. You reach
+  services in the VM on the VM's own IP address.
 
 Not solved yet: network access. The VM can reach the internet and your local network without
 restriction. It should be possible to force all traffic through a proxy with allow/deny rules, but I
@@ -50,17 +52,20 @@ Below, `<project>` is the name of your repo's directory.
 - This line in `~/.ssh/config`, used both for `ssh` and for fetching from the VM with git:
 
   ```
-  Include ~/.lima/*/ssh.config
+  Include ~/.devenv-lima-vm/*/ssh.config
   ```
 
-Lima picks the VM type. To change it, set it in `~/.lima/_config/default.yaml`:
+The VMs live in their own Lima home, `~/.devenv-lima-vm`, so settings in your regular `~/.lima` do
+not apply to them. The devenv shell sets `LIMA_HOME` to it, so `limactl` there sees these VMs.
+
+Lima picks the VM type. To change it, set it in `~/.devenv-lima-vm/_config/default.yaml`:
 
 ```yaml
 vmType: qemu
 ```
 
-Don't add `mounts` to that file: Lima applies them to every VM, and this one should only see the
-repo's `.git`. For krunkit on macOS, see [the note below](#krunkit-on-macos).
+Don't add `mounts` to that file: Lima applies them to every VM, and these should only see the repo's
+`.git`.
 
 ## Setup
 
@@ -116,12 +121,16 @@ vm.configDir   = "vm";                 # where the NixOS configuration lives in 
 vm.configName  = "devenv-vm";          # must match `prefix` in vm/flake.nix
 vm.remote      = "vm";                 # git remote on the host that points at the VM
 vm.template    = "github:nixos-lima";  # Lima template for new VMs
+vm.networks    = [ ];                  # Lima networks; see "Reaching services in the VM"
 vm.cpus        = 4;
 vm.memory      = "8GiB";
 vm.disk        = "100GiB";
 ```
 
 `vm.hostName` is ignored if you set `networking.hostName` in `vm/configuration.nix`.
+
+`vm.template`, `vm.networks`, `vm.cpus`, `vm.memory` and `vm.disk` are applied when the VM is
+created. Changing them later has no effect on an existing VM.
 
 ## Using the VM
 
@@ -144,6 +153,31 @@ Host and VM each have their own working copy. Move work between them with git:
 | VM → host | Commit in the VM, then run `git fetch vm` on the host |
 
 To commit in the VM it needs a git identity; see the next section.
+
+## Reaching services in the VM
+
+Ports the VM listens on are not forwarded to the host. To reach a service, connect to the VM's IP
+address, which takes two steps:
+
+1. Give the VM an address the host can reach, with `vm.networks` in `devenv.nix`:
+
+   | Host and VM type | `vm.networks`              | Needs                                                                  |
+   | ---------------- | -------------------------- | ---------------------------------------------------------------------- |
+   | macOS, vz        | `[ { vzNAT = true; } ]`    | Nothing                                                                |
+   | macOS, QEMU      | `[ { lima = "shared"; } ]` | [socket_vmnet](https://lima-vm.io/docs/config/network/vmnet/), as root |
+   | Linux, QEMU      | Not available              | Use an SSH tunnel: `ssh -L 3000:localhost:3000 lima-devenv-<project>`  |
+
+   The `vm` process prints the VM's addresses when it starts (`[vm] addresses: …`).
+
+2. Open the port in the VM's firewall, in `vm/configuration.nix`:
+
+   ```nix
+   networking.firewall.allowedTCPPorts = [ 3000 ];
+   ```
+
+Lima itself still listens on a few random `127.0.0.1` ports on the host, and this cannot be turned
+off: one forwards to the VM's SSH server (`ssh` and `git fetch vm` use it, and it only accepts
+Lima's own key), the others are Lima's DNS resolver for the VM.
 
 ## Personal setup in the VM
 
@@ -242,26 +276,6 @@ Stop `devenv up`. From the project's devenv shell:
 limactl delete devenv-<project>
 git remote remove vm
 ```
-
-## krunkit on macOS
-
-This is optional. krunkit is a new microvm that Lima has experimental support for.
-
-krunkit is not part of the devenv shell; install it yourself, then make it Lima's default VM type in
-`~/.lima/_config/default.yaml`:
-
-```yaml
-vmType: krunkit
-```
-
-I installed it with Nix (nix-darwin) and ran into two problems. With Homebrew you probably won't.
-
-- The file system mount only worked with the `krunkit` package from nixpkgs-unstable.
-- The EFI image was not found until I added this to my nix-darwin configuration:
-
-  ```nix
-  environment.pathsToLink = [ "/share/krunkit" ];
-  ```
 
 ## This repository
 

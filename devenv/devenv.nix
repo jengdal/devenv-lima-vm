@@ -30,11 +30,19 @@ let
   # Written by the guest's NixOS module; absent on hosts.
   isVmGuest = builtins.pathExists "/etc/devenv-vm";
 
+  # Our own Lima home, so the user's global ~/.lima settings don't apply to these VMs.
+  # $HOME expands in the shell, not in Nix.
+  limaHome = "$HOME/.devenv-lima-vm";
+
   limaSet = lib.concatStringsSep " | " [
     ".cpus = ${toString cfg.cpus}"
     ''.memory = "${cfg.memory}"''
     ''.disk = "${cfg.disk}"''
     ''.mounts = [{"location": "${root}/.git", "mountPoint": "/mnt/host-repo.git", "writable": false}]''
+    # Never forward guest ports to the host; services are reached on the VM's own IP.
+    # Two rules: the first covers ports bound to loopback, the second those bound to any address.
+    ''.portForwards = [{"guestIP": "127.0.0.1", "proto": "any", "ignore": true}, {"guestIP": "0.0.0.0", "proto": "any", "ignore": true}]''
+    ".networks = ${builtins.toJSON cfg.networks}"
   ];
 
   # Settings for the in-VM commands; $HOME expands in the guest when sourced.
@@ -102,6 +110,16 @@ in
       default = "github:nixos-lima";
       description = "Lima template used when creating the instance.";
     };
+    networks = mkOption {
+      type = types.listOf types.attrs;
+      default = [ ];
+      example = lib.literalExpression "[ { vzNAT = true; } ]";
+      description = ''
+        Lima `networks` for the instance, used to give the VM an IP address the host can reach:
+        `[ { vzNAT = true; } ]` for vz, `[ { lima = "shared"; } ]` for QEMU on macOS (needs
+        socket_vmnet). Applied when the VM is created.
+      '';
+    };
     cpus = mkOption {
       type = types.int;
       default = 4;
@@ -120,7 +138,14 @@ in
     # Lima on every host, plus QEMU on Linux, where it is Lima's default VM type.
     packages = [ pkgs.lima ] ++ lib.optionals pkgs.stdenv.isLinux [ pkgs.qemu ];
 
+    # For limactl in the devenv shell; the vm process sets it itself.
+    enterShell = ''
+      export LIMA_HOME="${limaHome}"
+    '';
+
     processes.vm.exec = ''
+      export LIMA_HOME="${limaHome}"
+
       if ! limactl list -q | grep -qx ${cfg.name}; then
         limactl create --tty=false --name=${cfg.name} \
           --set '${limaSet}' ${cfg.template}
@@ -138,6 +163,8 @@ in
         # Apply a changed hostname; the unit is missing before the first provision.
         limactl shell --workdir / ${cfg.name} -- \
           sudo systemctl restart devenv-vm-hostname.service 2>/dev/null || true
+        echo "[vm] addresses: $(limactl shell --workdir / ${cfg.name} -- \
+          ip -4 -o addr show scope global | awk '{print $2 "=" $4}' | tr '\n' ' ')"
         if ! limactl shell --workdir / ${cfg.name} -- test -e /var/lib/devenv-vm/provisioned; then
           echo "[vm] bootstrapping: clone + first provision"
           limactl shell --workdir / ${cfg.name} -- \
